@@ -42,7 +42,14 @@
   };
 
   /** State machine. */
-  const STATE = { IDLE: 'idle', CONNECTING: 'connecting', LIVE: 'live', ENDED: 'ended', NO_CLAUDE: 'no-claude' };
+  const STATE = {
+    IDLE: 'idle',
+    CONNECTING: 'connecting',
+    LIVE: 'live',
+    ENDED: 'ended',
+    NO_CLAUDE: 'no-claude',
+    RECONNECTING: 'reconnecting',  // v1.44 Commit 3 — re-attach loop active
+  };
   let state = STATE.IDLE;
 
   let term = null;
@@ -65,6 +72,28 @@
    * server can scope the disposal to one terminal rather than all.
    */
   let currentSessionId = null;
+  /**
+   * Commit 3 re-attach loop. Set true while a re-attach is in flight so
+   * concurrent ws.close events (e.g. user clicks Restart mid-reconnect)
+   * can short-circuit. Reset by every state transition out of RECONNECTING.
+   */
+  let reattachInFlight = false;
+  /**
+   * Set true after a {type:"reattach-begin"} text frame and reset after
+   * the next binary frame is treated as replay payload. The flag is what
+   * lets the message handler distinguish "this binary is the scrollback
+   * replay, write RIS first to clear xterm" from "this is live PTY
+   * output, just feed it through."
+   */
+  let nextBinaryIsReplay = false;
+  /**
+   * Re-attach backoff schedule (ms). 1s, 2s, 4s, 8s, then 8s steady until
+   * 60s total elapsed (Commit 3 detach window). If all attempts fail,
+   * fall through to ENDED state and the user clicks Restart for a fresh
+   * session.
+   */
+  const REATTACH_BACKOFF_MS = [1000, 2000, 4000, 8000];
+  const REATTACH_WINDOW_MS = 60_000;
   /**
    * 25s client-side WS keepalive interval (v1.44+). Belt-and-suspenders with
    * the server-side ping in terminal-agent.ts: server pings cover most
@@ -164,6 +193,187 @@
     } catch (err) {
       return { error: err && err.message ? err.message : String(err) };
     }
+  }
+
+  /**
+   * Commit 3 — re-attach loop. Triggered by an unexpected WS close
+   * (anything other than the v1.44 intentional codes) while state was
+   * LIVE. Posts /pty-session/reattach with the current sessionId; on
+   * success opens a new WS, feeds the {type:"reattach-begin"} +
+   * replay-binary handshake from the agent into xterm.
+   *
+   * Backoff: 1s, 2s, 4s, 8s, then 8s steady. Total wall budget is the
+   * server's DETACH_WINDOW_MS (default 60s) — past that point the
+   * server has disposed our session and any re-attach attempt will
+   * return 410 Gone.
+   *
+   * Aborts on:
+   *   - reattachInFlight transitions to false (user clicked Restart or
+   *     navigated away)
+   *   - 410 Gone from /pty-session/reattach (lease expired)
+   *   - 401 (auth invalid)
+   *   - REATTACH_WINDOW_MS elapsed
+   */
+  function startReattachLoop(prevSessionId) {
+    if (!prevSessionId) {
+      setState(STATE.ENDED);
+      return;
+    }
+    const serverPort = getServerPort();
+    const authToken = getAuthToken();
+    if (!serverPort || !authToken) {
+      setState(STATE.ENDED);
+      return;
+    }
+    reattachInFlight = true;
+    setState(STATE.RECONNECTING);
+    const startedAt = Date.now();
+    let attempt = 0;
+
+    const tick = async () => {
+      if (!reattachInFlight) return;
+      if (Date.now() - startedAt > REATTACH_WINDOW_MS) {
+        reattachInFlight = false;
+        setState(STATE.ENDED);
+        return;
+      }
+      attempt += 1;
+      let resp;
+      try {
+        resp = await fetch(`http://127.0.0.1:${serverPort}/pty-session/reattach`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({ sessionId: prevSessionId }),
+          credentials: 'include',
+        });
+      } catch (err) {
+        scheduleNextAttempt();
+        return;
+      }
+      if (resp.status === 410) {
+        // Server disposed the session — lease window closed. No point
+        // retrying; fall through so the user clicks Restart for a fresh
+        // session.
+        reattachInFlight = false;
+        setState(STATE.ENDED);
+        return;
+      }
+      if (resp.status === 401) {
+        reattachInFlight = false;
+        autoConnectAborted = true;
+        setState(STATE.IDLE, {
+          message: 'Auth invalid — reload the sidebar or restart your gstack session.',
+        });
+        return;
+      }
+      if (!resp.ok) {
+        scheduleNextAttempt();
+        return;
+      }
+      let body;
+      try { body = await resp.json(); } catch { body = null; }
+      if (!body || !body.terminalPort || !body.attachToken) {
+        scheduleNextAttempt();
+        return;
+      }
+      reattachInFlight = false;
+      openReattachWebSocket(body.terminalPort, body.attachToken, body.sessionId || prevSessionId);
+    };
+
+    const scheduleNextAttempt = () => {
+      const backoffIdx = Math.min(attempt - 1, REATTACH_BACKOFF_MS.length - 1);
+      const delay = REATTACH_BACKOFF_MS[backoffIdx] ?? 8000;
+      setTimeout(tick, delay);
+    };
+
+    tick();
+  }
+
+  /**
+   * Open the post-reattach WebSocket. Mostly a clone of connect()'s
+   * attach wiring but with the {type:"reattach-begin"} → RIS → binary
+   * replay handshake added. The xterm element is REUSED (not disposed) so
+   * the buffer flash is minimal — RIS clears it cleanly just before the
+   * replay arrives.
+   */
+  function openReattachWebSocket(terminalPort, attachToken, sessionId) {
+    currentSessionId = sessionId || null;
+    try { window.gstackPtySession = currentSessionId; } catch {}
+    setState(STATE.LIVE);
+    ensureXterm();
+    nextBinaryIsReplay = false;
+    ws = new WebSocket(`ws://127.0.0.1:${terminalPort}/ws`, [`gstack-pty.${attachToken}`]);
+    ws.binaryType = 'arraybuffer';
+
+    ws.addEventListener('open', () => {
+      try {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      } catch {}
+      if (keepaliveInterval) clearInterval(keepaliveInterval);
+      keepaliveInterval = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try { ws.send(JSON.stringify({ type: 'keepalive' })); } catch {}
+      }, KEEPALIVE_INTERVAL_MS);
+    });
+
+    ws.addEventListener('message', (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'reattach-begin') {
+            // Clear xterm before the replay binary arrives — RIS (\x1bc)
+            // is a full hardware reset that flushes the buffer and
+            // resets all attributes. The server's replay starts with
+            // DECSTR + optional alt-screen re-enter for safety.
+            try { term.write('\x1bc'); } catch {}
+            nextBinaryIsReplay = true;
+            return;
+          }
+          if (msg.type === 'error' && msg.code === 'CLAUDE_NOT_FOUND') {
+            setState(STATE.NO_CLAUDE);
+            try { ws.close(); } catch {}
+            return;
+          }
+          if (msg.type === 'ping') {
+            try { ws.send(JSON.stringify({ type: 'pong', ts: msg.ts })); } catch {}
+            return;
+          }
+        } catch {}
+        return;
+      }
+      const buf = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
+      // First binary frame after reattach-begin is the replay payload;
+      // write it through unchanged (server already prefixed soft-reset).
+      // Subsequent binary frames are live PTY output.
+      term.write(buf);
+      if (nextBinaryIsReplay) nextBinaryIsReplay = false;
+    });
+
+    ws.addEventListener('close', (ev) => {
+      ws = null;
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = null;
+      }
+      // If THIS reattach WS also closes uncleanly, recurse into another
+      // re-attach loop with the SAME sessionId — the server may still
+      // be inside the detach window. The state check + sessionId guard
+      // prevent runaway recursion (ENDED short-circuits the next loop).
+      if (state !== STATE.LIVE) return;
+      const code = (ev && (ev.code ?? 1006)) || 1006;
+      const intentional = code === 1000 || code === 4001 || code === 4404;
+      if (intentional || !currentSessionId) {
+        setState(intentional ? STATE.ENDED : STATE.ENDED);
+        return;
+      }
+      startReattachLoop(currentSessionId);
+    });
+    ws.addEventListener('error', (err) => {
+      console.error('[gstack terminal] reattach ws error', err);
+    });
   }
 
   async function checkClaudeAvailable(terminalPort) {
@@ -455,13 +665,26 @@
       term.write(buf);
     });
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (ev) => {
       ws = null;
       if (keepaliveInterval) {
         clearInterval(keepaliveInterval);
         keepaliveInterval = null;
       }
-      if (state !== STATE.NO_CLAUDE) setState(STATE.ENDED);
+      if (state === STATE.NO_CLAUDE) return;
+      // v1.44 Commit 3 — re-attach loop on transient close. Clean codes
+      // (1000 = pty exited, 4001 = intentional restart, 4404 = no-claude)
+      // skip the loop and fall through to ENDED. Any other code
+      // (1006 abnormal, 1001 going-away) is a candidate for re-attach
+      // within the 60s server-side detach window, provided we still
+      // have a sessionId to match against.
+      const code = (ev && (ev.code ?? 1006)) || 1006;
+      const intentional = code === 1000 || code === 4001 || code === 4404;
+      if (state === STATE.LIVE && !intentional && currentSessionId) {
+        startReattachLoop(currentSessionId);
+        return;
+      }
+      setState(STATE.ENDED);
     });
 
     ws.addEventListener('error', (err) => {
@@ -648,13 +871,26 @@
       term.write(buf);
     });
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (ev) => {
       ws = null;
       if (keepaliveInterval) {
         clearInterval(keepaliveInterval);
         keepaliveInterval = null;
       }
-      if (state !== STATE.NO_CLAUDE) setState(STATE.ENDED);
+      if (state === STATE.NO_CLAUDE) return;
+      // v1.44 Commit 3 — re-attach loop on transient close. Clean codes
+      // (1000 = pty exited, 4001 = intentional restart, 4404 = no-claude)
+      // skip the loop and fall through to ENDED. Any other code
+      // (1006 abnormal, 1001 going-away) is a candidate for re-attach
+      // within the 60s server-side detach window, provided we still
+      // have a sessionId to match against.
+      const code = (ev && (ev.code ?? 1006)) || 1006;
+      const intentional = code === 1000 || code === 4001 || code === 4404;
+      if (state === STATE.LIVE && !intentional && currentSessionId) {
+        startReattachLoop(currentSessionId);
+        return;
+      }
+      setState(STATE.ENDED);
     });
     ws.addEventListener('error', (err) => {
       console.error('[gstack terminal] ws error', err);
