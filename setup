@@ -1319,10 +1319,14 @@ if [ "$NO_TEAM_MODE" -ne 1 ] \
   PT_DECISION="$PLAN_TUNE_HOOKS_MODE"
   [ -z "$PT_DECISION" ] && PT_DECISION="${GSTACK_PLAN_TUNE_HOOKS:-}"
   [ -z "$PT_DECISION" ] && PT_DECISION="$("$GSTACK_CONFIG" get plan_tune_hooks 2>/dev/null || true)"
+  # Normalize: strip whitespace + lowercase so "YES", "Yes", " yes" from a flag
+  # or env var all resolve correctly (an unrecognized opt-in must NOT silently
+  # downgrade to skip). Unknown values fall through to "prompt".
+  PT_DECISION=$(printf '%s' "$PT_DECISION" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
   case "$PT_DECISION" in
-    y|yes|true|install) PT_DECISION="yes" ;;
-    n|no|false|skip)    PT_DECISION="no" ;;
-    *)                  PT_DECISION="prompt" ;;
+    y|yes|true|install|on|1) PT_DECISION="yes" ;;
+    n|no|false|skip|off|0)   PT_DECISION="no" ;;
+    *)                       PT_DECISION="prompt" ;;
   esac
 
   _install_plan_tune_hooks() {
@@ -1362,6 +1366,7 @@ if [ "$NO_TEAM_MODE" -ne 1 ] \
     # Real interactive terminal with no recorded preference: ask, with explicit
     # consent + diff preview. The read is time-bounded and defaults to "skip" so
     # it can never hang an automated/forwarded TTY (the conductor failure mode).
+    _PT_PROMPT_TIMEOUT=10  # single source of truth for the read + the countdown text
     log ""
     log "──────────────────────────────────────────────────────────"
     log "Plan-tune cathedral: install Claude Code hooks?"
@@ -1386,8 +1391,8 @@ if [ "$NO_TEAM_MODE" -ne 1 ] \
     log "Backup: settings.json.bak.<ts> written before any mutation."
     log "Rollback: $SETTINGS_HOOK rollback"
     log ""
-    printf "Install both hooks now? [y/N] (default: N, auto-skips in 10s): "
-    read -t 10 -r PLAN_TUNE_INSTALL_REPLY </dev/tty 2>/dev/null || PLAN_TUNE_INSTALL_REPLY=""
+    printf "Install both hooks now? [y/N] (default: N, auto-skips in %ss): " "$_PT_PROMPT_TIMEOUT"
+    read -t "$_PT_PROMPT_TIMEOUT" -r PLAN_TUNE_INSTALL_REPLY </dev/tty 2>/dev/null || PLAN_TUNE_INSTALL_REPLY=""
     case "$PLAN_TUNE_INSTALL_REPLY" in
       y|Y)
         _install_plan_tune_hooks
