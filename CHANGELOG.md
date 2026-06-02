@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.59.0.0] - 2026-06-01
+
+## **The whole plan-review family got carved. plan-eng, plan-design, and plan-devex now load their review bodies only after you have agreed scope.**
+
+The three remaining heavyweight plan-review skills followed `/plan-ceo-review` into the skeleton + on-demand section pattern. Each one's review body — the multi-section deep review, the outside voice, the required outputs, and the review report writer — moved into `sections/review-sections.md` behind a single STOP-Read that fires only after Step 0 scope is agreed. Step 0 (the conversation that decides what to review) and the plan-mode exit gate stay in the always-loaded skeleton. Same pattern, same safety net: Layer 0 confirms the AskUserQuestion format spec stays always-loaded in every skeleton, and the carved-vs-verbose proof established for plan-ceo holds for the family.
+
+### The numbers that matter
+
+Measured from the generated skeletons (`wc -c <skill>/SKILL.md`), regenerated for all hosts:
+
+| Skill | Before | After | Δ |
+|-------|--------|-------|---|
+| plan-eng-review | 106,984 B | 54,892 B | -48.7% |
+| plan-design-review | 112,057 B | 76,024 B | -32.2% |
+| plan-devex-review | 110,621 B | 69,658 B | -37.0% |
+
+Combined with v1.54-v1.58, six skills are now carved (ship, plan-ceo-review, office-hours, plan-eng-review, plan-design-review, plan-devex-review) and the shared preamble shed its CJK manual corpus-wide. The always-loaded review prose loads only when a review actually reaches it.
+
+### What this means for you
+
+Every plan-review skill starts lighter and pulls in its review body on demand. The reviews are identical pass for pass; only what is in context when changed. External hosts (codex, factory, kiro, opencode) still receive the full inline skill, so nothing regresses off Claude.
+
+### Itemized changes
+
+#### Changed
+- `/plan-eng-review`, `/plan-design-review`, `/plan-devex-review` are each a skeleton + one `sections/review-sections.md` on Claude; Step 0 stays always-loaded.
+- Parity, size-budget, and gen-skill-docs treat all three as carved skills (union content checks, skeleton-shrink assertions).
+
 ## [1.58.0.0] - 2026-06-01
 
 ## **Every skill that asks you questions got a little lighter, all at once — the AskUserQuestion preamble stopped carrying its rare-case manuals inline.**
