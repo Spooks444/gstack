@@ -3269,8 +3269,8 @@ describe('GSTACK REVIEW REPORT mandatory unresolved-decisions status', () => {
       // The "never omit / always final" contract must be present, not just the phrase.
       expect(content).toContain('Unresolved-decisions status (MANDATORY');
       expect(content).toMatch(/never omitted/);
-      // \s+ tolerates the prose line-wrap between "final" and "non-whitespace".
-      expect(content).toMatch(/final\s+non-whitespace line/);
+      // \s+ tolerates prose line-wraps within "final non-whitespace line".
+      expect(content).toMatch(/final\s+non-whitespace\s+line/);
     });
   }
 
