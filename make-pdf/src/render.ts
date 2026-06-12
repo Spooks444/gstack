@@ -35,6 +35,14 @@ export interface RenderOptions {
   // Page layout
   pageSize?: "letter" | "a4" | "legal" | "tabloid";
   margins?: string;
+  // Per-side margins (override `margins`). Must reach the CSS @page rule:
+  // when a landscape promotion flips preferCSSPageSize on, the CSS margins
+  // are the ones Chromium honors — dropping per-side flags there would
+  // silently change the whole document's layout (Codex P2).
+  marginTop?: string;
+  marginRight?: string;
+  marginBottom?: string;
+  marginLeft?: string;
 
   // Footer behavior. pageNumbers defaults to true. When footerTemplate is set,
   // CSS page numbers are suppressed so the custom Chromium footer wins cleanly.
@@ -97,7 +105,9 @@ export function render(opts: RenderOptions): RenderResult {
     confidential: opts.confidential !== false,
     runningHeader: derivedTitle,
     pageSize: opts.pageSize,
-    margins: opts.margins,
+    // Compose per-side margins into the CSS shorthand so @page stays the
+    // single source of truth even under preferCSSPageSize.
+    margins: composeMargins(opts),
     pageNumbers: showPageNumbers,
   };
   const css = printCss(cssOptions);
@@ -114,11 +124,14 @@ export function render(opts: RenderOptions): RenderResult {
 
   // TOC anchors must resolve: assign id="toc-N" to each H1-H3 in the same
   // order buildTocBlock scans them, or every TOC link is a dead href (masked
-  // in PDFs by Chromium outline bookmarks, glaring in --to html).
-  const anchoredHtml = opts.toc ? addHeadingIds(typographicHtml) : typographicHtml;
+  // in PDFs by Chromium outline bookmarks, glaring in --to html). Headings
+  // that already carry an id keep it — the ids array records the ACTUAL id
+  // per heading so TOC entries always link to something real.
+  const anchored = opts.toc ? addHeadingIds(typographicHtml) : { html: typographicHtml, ids: [] };
+  const anchoredHtml = anchored.html;
 
   const tocBlock = opts.toc
-    ? buildTocBlock(anchoredHtml)
+    ? buildTocBlock(anchoredHtml, anchored.ids)
     : "";
 
   // Wrap body in .chapter sections at H1 boundaries if chapter breaks are on.
@@ -267,13 +280,13 @@ function buildCoverBlock(opts: {
  * Page numbers are filled in by Paged.js (when --toc is passed and Paged.js
  * polyfill is injected).
  */
-function buildTocBlock(html: string): string {
+function buildTocBlock(html: string, ids: string[] = []): string {
   const headings = extractHeadings(html);
   if (headings.length === 0) return "";
 
   const items = headings.map((h, i) => {
     const level = h.level >= 2 ? "level-2" : "level-1";
-    const id = `toc-${i}`;
+    const id = ids[i] ?? `toc-${i}`;
     return [
       `  <li class="${level}">`,
       `    <span class="toc-title"><a href="#${id}">${escapeHtml(h.text)}</a></span>`,
@@ -296,16 +309,23 @@ function buildTocBlock(html: string): string {
 /**
  * Assign id="toc-N" to every H1-H3 in document order — the same order
  * extractHeadings/buildTocBlock use, so anchors and entries line up by index.
- * Headings that already carry an id keep it AND gain nothing (the TOC link
- * targets toc-N, so we only skip tagging when one exists to avoid dupes).
+ * A heading that already carries an id keeps it, and the returned ids array
+ * records the actual id for that slot so the TOC links to the real anchor
+ * instead of a nonexistent toc-N.
  */
-function addHeadingIds(html: string): string {
-  let i = 0;
-  return html.replace(/<(h[1-3])([^>]*)>/gi, (full, tag: string, attrs: string) => {
-    const id = `toc-${i++}`;
-    if (/\bid\s*=/i.test(attrs)) return full;
+function addHeadingIds(html: string): { html: string; ids: string[] } {
+  const ids: string[] = [];
+  const out = html.replace(/<(h[1-3])([^>]*)>/gi, (full, tag: string, attrs: string) => {
+    const existing = attrs.match(/\bid\s*=\s*["']([^"']*)["']/i)?.[1];
+    if (existing) {
+      ids.push(existing);
+      return full;
+    }
+    const id = `toc-${ids.length}`;
+    ids.push(id);
     return `<${tag}${attrs} id="${id}">`;
   });
+  return { html: out, ids };
 }
 
 function extractHeadings(html: string): Array<{ level: number; text: string }> {
@@ -376,6 +396,23 @@ function decodeTextEntities(s: string): string {
     .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
     .replace(/&amp;/g, "&");
+}
+
+/** Compose `margin: top right bottom left` from per-side overrides + base. */
+function composeMargins(opts: {
+  margins?: string; marginTop?: string; marginRight?: string;
+  marginBottom?: string; marginLeft?: string;
+}): string | undefined {
+  const base = opts.margins ?? "1in";
+  if (!opts.marginTop && !opts.marginRight && !opts.marginBottom && !opts.marginLeft) {
+    return opts.margins;
+  }
+  return [
+    opts.marginTop ?? base,
+    opts.marginRight ?? base,
+    opts.marginBottom ?? base,
+    opts.marginLeft ?? base,
+  ].join(" ");
 }
 
 function stripTags(html: string): string {

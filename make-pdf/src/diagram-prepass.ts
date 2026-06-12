@@ -80,6 +80,8 @@ export interface PrepassImageOptions {
  * 2 × contentWidth × 300dpi down to contentWidth × 300dpi. */
 const PRINT_DPI = 300;
 const DOWNSCALE_FACTOR = 2;
+/** Per-image read ceiling — bounds memory before any policy runs. */
+const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
 
 export class StrictModeError extends Error {
   constructor(msg: string) {
@@ -584,7 +586,7 @@ export function inlineLocalImages(html: string, opts: PrepassImageOptions): stri
   const targetPx = Math.round(opts.contentWidthIn * PRINT_DPI);
   // An image referenced N times is read/probed/downscaled once; the same data
   // URI string is reused (also dedupes memory until the final join).
-  const memo = new Map<string, string>();
+  const memo = new Map<string, { dataUri: string; attrs: string }>();
 
   return html.replace(IMG_TAG_RE, (tag) => {
     const srcMatch = tag.match(SRC_RE);
@@ -601,36 +603,73 @@ export function inlineLocalImages(html: string, opts: PrepassImageOptions): stri
       // Absolute URL with a scheme (http, https, file, …)
       if (opts.allowNetwork && /^https?:/i.test(src)) return tag;
       if (/^https?:/i.test(src)) {
-        const msg = `remote image not fetched (offline posture): ${src}`;
+        const msg = `remote image blocked (offline posture): ${src}`;
         if (opts.strict) throw new StrictModeError(msg + " — re-run without --strict or pass --allow-network");
         opts.warn(msg);
-        return tag;
+        // Leaving the tag would make Chromium fetch it at print time anyway —
+        // the warn would be a lie. Replace with a visible placeholder.
+        return buildBlockedRemotePlaceholder(src);
       }
       // file:// and friends fall through to the local path branch
       if (!src.startsWith("file:")) return tag;
     }
 
+    // decodeURIComponent throws on malformed escapes (foo%zz.png) — a broken
+    // URL must degrade to the missing-image path, not crash the run.
+    let decodedSrc = src;
+    try {
+      decodedSrc = decodeURIComponent(src);
+    } catch { /* keep raw src */ }
+
     const filePath = src.startsWith("file:")
       ? fileURLToPath(src)
       : isDrivePath
         ? path.resolve(src)
-        : path.resolve(opts.inputDir, decodeURIComponent(src));
+        : path.resolve(opts.inputDir, decodedSrc);
 
     const cached = memo.get(filePath);
     if (cached !== undefined) return rewriteImgTag(tag, cached);
 
+    if (!fs.existsSync(filePath)) {
+      const msg = `image not found: ${src} (resolved to ${filePath})`;
+      if (opts.strict) throw new StrictModeError(msg);
+      opts.warn(msg);
+      return buildMissingImagePlaceholder(src);
+    }
+
     // Out-of-tree reads are legal (local CLI semantics — like pandoc) but
     // never silent: an agent PDF-ing untrusted markdown should not quietly
     // embed ~/.ssh/config into a shareable document. --strict makes it fatal.
-    const inputRoot = path.resolve(opts.inputDir) + path.sep;
-    if (!filePath.startsWith(inputRoot)) {
-      const msg = `image resolves OUTSIDE the input directory: ${src} → ${filePath}`;
+    // Compare REAL paths — a symlink inside the input dir pointing outside
+    // would otherwise pass a string-prefix check (Codex adversarial finding).
+    // Runs after the existence check: realpath of a missing file can't
+    // resolve, and on macOS /var vs /private/var would false-positive.
+    const inputRoot = safeRealpath(path.resolve(opts.inputDir)) + path.sep;
+    const realFilePath = safeRealpath(filePath);
+    if (!realFilePath.startsWith(inputRoot)) {
+      const msg = `image resolves OUTSIDE the input directory: ${src} → ${realFilePath}`;
       if (opts.strict) throw new StrictModeError(msg + " — move it under the markdown's directory or drop --strict");
       opts.warn(msg);
     }
 
-    if (!fs.existsSync(filePath)) {
-      const msg = `image not found: ${src} (resolved to ${filePath})`;
+    // Bound the read BEFORE reading: a markdown image pointing at a special
+    // file (fifo, device) would hang readFileSync, and a multi-GB file would
+    // exhaust memory before any policy ran.
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      opts.warn(`image unreadable: ${src}`);
+      return buildMissingImagePlaceholder(src);
+    }
+    if (!stat.isFile()) {
+      const msg = `image is not a regular file: ${src}`;
+      if (opts.strict) throw new StrictModeError(msg);
+      opts.warn(msg);
+      return buildMissingImagePlaceholder(src);
+    }
+    if (stat.size > MAX_IMAGE_BYTES) {
+      const msg = `image exceeds ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB cap: ${src} (${Math.round(stat.size / 1024 / 1024)}MB)`;
       if (opts.strict) throw new StrictModeError(msg);
       opts.warn(msg);
       return buildMissingImagePlaceholder(src);
@@ -665,20 +704,17 @@ export function inlineLocalImages(html: string, opts: PrepassImageOptions): stri
     const attrs = dims
       ? ` data-gstack-px-width="${Math.round(dims.width)}" data-gstack-px-height="${Math.round(dims.height)}"`
       : "";
-    memo.set(filePath, `${dataUri} ${attrs}`);
+    memo.set(filePath, { dataUri, attrs });
     return rewriteImgTag(tag, memo.get(filePath)!);
   });
 }
 
-/** Apply a memoized `dataUri attrs` payload to an img tag. */
-function rewriteImgTag(tag: string, memoEntry: string): string {
-  const sep = memoEntry.indexOf(" ");
-  const dataUri = memoEntry.slice(0, sep);
-  const attrs = memoEntry.slice(sep + 1);
+/** Apply a memoized inline result to an img tag. */
+function rewriteImgTag(tag: string, entry: { dataUri: string; attrs: string }): string {
   // Function replacement: data URIs are user-content-derived; string-form
   // replace() would expand $-patterns inside them.
-  let out = tag.replace(SRC_RE, () => `src="${dataUri}"`);
-  if (attrs) out = out.replace(/^<img\b/i, () => `<img${attrs}`);
+  let out = tag.replace(SRC_RE, () => `src="${entry.dataUri}"`);
+  if (entry.attrs) out = out.replace(/^<img\b/i, () => `<img${entry.attrs}`);
   return out;
 }
 
@@ -702,6 +738,22 @@ function buildMissingImagePlaceholder(src: string): string {
     `<span class="image-missing" role="img" aria-label="missing image">` +
     `[missing image: ${escapeHtml(src)}]</span>`
   );
+}
+
+function buildBlockedRemotePlaceholder(src: string): string {
+  return (
+    `<span class="image-missing" role="img" aria-label="remote image blocked">` +
+    `[remote image blocked (use --allow-network): ${escapeHtml(src)}]</span>`
+  );
+}
+
+/** realpath that degrades to the input path when resolution fails. */
+function safeRealpath(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return p;
+  }
 }
 
 function mimeFromExtension(p: string): string {

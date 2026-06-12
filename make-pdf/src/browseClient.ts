@@ -176,6 +176,9 @@ function runBrowse(args: string[]): string {
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,    // 16MB; tab content can be large
       stdio: ["ignore", "pipe", "pipe"],
+      // A wedged daemon (or a hostile mermaid source spinning the renderer)
+      // must fail the run, not hang it forever.
+      timeout: 120_000,
     });
   } catch (err: any) {
     const exitCode = typeof err.status === "number" ? err.status : 1;

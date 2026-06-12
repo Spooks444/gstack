@@ -112,6 +112,10 @@ export async function generate(opts: GenerateOptions): Promise<string> {
     confidential: opts.confidential,
     pageSize: opts.pageSize,
     margins: opts.margins,
+    marginTop: opts.marginTop,
+    marginRight: opts.marginRight,
+    marginBottom: opts.marginBottom,
+    marginLeft: opts.marginLeft,
     pageNumbers: opts.pageNumbers,
     footerTemplate: opts.footerTemplate,
   });

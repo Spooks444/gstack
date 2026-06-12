@@ -277,12 +277,45 @@ describe("inlineLocalImages", () => {
     ).toThrow(StrictModeError);
   });
 
-  test("remote image warns and is left untouched (offline posture)", () => {
+  test("remote image is BLOCKED with a visible placeholder (offline posture)", () => {
+    // Leaving the tag would make Chromium fetch it at print time anyway —
+    // the offline posture must remove the src, not just warn about it.
     const warnings: string[] = [];
     const tag = `<img src="https://example.com/x.png">`;
     const out = inlineLocalImages(tag, { ...base, warn: (m) => warnings.push(m) });
-    expect(out).toBe(tag);
+    expect(out).not.toContain("https://example.com/x.png\"");
+    expect(out).toContain("remote image blocked");
     expect(warnings[0]).toContain("offline");
+  });
+
+  test("symlink escaping the input dir is caught by the realpath check", () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "prepass-symlink-"));
+    fs.writeFileSync(path.join(outside, "secret.png"), tinyPng(5, 5));
+    const link = path.join(dir, "innocent.png");
+    try {
+      fs.symlinkSync(path.join(outside, "secret.png"), link);
+      const warnings: string[] = [];
+      inlineLocalImages(`<img src="innocent.png">`, { ...base, warn: (m) => warnings.push(m) });
+      expect(warnings.some((w) => w.includes("OUTSIDE the input directory"))).toBe(true);
+    } finally {
+      try { fs.unlinkSync(link); } catch { /* ignore */ }
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("special files and oversized images degrade to placeholders, never hang", () => {
+    // Directory masquerading as an image — not a regular file.
+    fs.mkdirSync(path.join(dir, "dir.png"), { recursive: true });
+    const warnings: string[] = [];
+    const out = inlineLocalImages(`<img src="dir.png">`, { ...base, warn: (m) => warnings.push(m) });
+    expect(out).toContain("image-missing");
+    expect(warnings.some((w) => w.includes("not a regular file"))).toBe(true);
+  });
+
+  test("malformed percent-encoding degrades to missing-image, never throws", () => {
+    const warnings: string[] = [];
+    const out = inlineLocalImages(`<img src="foo%zz.png">`, { ...base, warn: (m) => warnings.push(m) });
+    expect(out).toContain("image-missing");
   });
 
   test("remote image + --allow-network passes silently", () => {

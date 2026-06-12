@@ -264,6 +264,13 @@ describe("printCss", () => {
     expect(css).toContain("margin: 72pt");
   });
 
+  test("per-side margins reach the CSS @page rule (preferCSSPageSize parity)", () => {
+    // Under a landscape promotion Chromium honors the CSS margins, not the
+    // CDP per-side options — render() must compose them into the shorthand.
+    const r = render({ markdown: "# T", marginLeft: "0.5in", marginRight: "0.5in" });
+    expect(r.printCss).toContain("margin: 1in 0.5in 1in 0.5in");
+  });
+
   test("emits letter page size by default", () => {
     const css = printCss();
     expect(css).toContain("size: letter");
