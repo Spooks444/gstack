@@ -427,6 +427,28 @@ export function applyRedactions(
   return { body, diff: diffLines.reverse().join("\n"), skipped };
 }
 
+/**
+ * Replace EVERY finding's span with `<REDACTED-{id}>`, regardless of tier or
+ * autoRedactable. For machine egress surfaces (telemetry error_message,
+ * #1947) where structure preservation doesn't matter and fail-closed beats
+ * fidelity. Returns null when any finding's span cannot be located — the
+ * caller must then drop the whole payload rather than risk leaking an
+ * unlocated secret. (Contrast applyRedactions, which is the interactive,
+ * autoRedactable-only, structure-preserving path.)
+ */
+export function redactFindingSpans(input: string, opts: ScanOptions = {}): string | null {
+  const { findings } = scan(input, opts);
+  const targets = findings.map((f) => ({ f, ...locateSpan(input, f) }));
+  if (targets.some((t) => t.start < 0)) return null;
+  // Right-to-left so earlier offsets remain valid after splicing.
+  targets.sort((a, b) => b.start - a.start);
+  let body = input;
+  for (const t of targets) {
+    body = body.slice(0, t.start) + `<REDACTED-${t.f.id}>` + body.slice(t.end);
+  }
+  return body;
+}
+
 function locateSpan(input: string, f: Finding): { start: number; end: number } {
   // Re-derive the offset from line/col on the original text.
   let offset = 0;

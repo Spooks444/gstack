@@ -201,6 +201,41 @@ describe('gstack-telemetry-log', () => {
     expect(event.error_message).toContain('not found');
   });
 
+  test('redacts credential spans in error_message before they touch disk (#1947)', () => {
+    setConfig('telemetry', 'anonymous');
+    const token = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
+    run(
+      `${BIN}/gstack-telemetry-log --skill qa --duration 10 --outcome error --error-message 'push failed: auth ${token} rejected by remote' --session-id red-1`,
+    );
+
+    const lines = readJsonl();
+    expect(lines).toHaveLength(1);
+    const event = JSON.parse(lines[0]);
+    // The span is masked, the surrounding triage context survives.
+    expect(event.error_message).toContain('<REDACTED-github.pat>');
+    expect(event.error_message).toContain('push failed');
+    expect(event.error_message).not.toContain(token);
+    // Raw bytes on disk never contain the token either.
+    expect(lines[0]).not.toContain(token);
+  });
+
+  test('fails closed: error_message becomes null when the redactor is unavailable (#1947)', () => {
+    setConfig('telemetry', 'anonymous');
+    const token = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
+    // PATH without bun: the redaction snippet cannot run, so the whole
+    // message must drop — never raw passthrough.
+    run(
+      `${BIN}/gstack-telemetry-log --skill qa --duration 10 --outcome error --error-message 'auth ${token} rejected' --session-id red-2`,
+      { PATH: '/usr/bin:/bin' },
+    );
+
+    const lines = readJsonl();
+    expect(lines).toHaveLength(1);
+    const event = JSON.parse(lines[0]);
+    expect(event.error_message).toBeNull();
+    expect(lines[0]).not.toContain(token);
+  });
+
   test('creates analytics directory if missing', () => {
     // Remove analytics dir
     const analyticsDir = path.join(tmpDir, 'analytics');
