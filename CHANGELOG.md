@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.58.3.0] - 2026-06-18
+
+## **GBrowser masks the full set of automation tells by default, on every path a page can reach.**
+## **Layer C stealth is always on, carries a per-install hardware identity, and survives the toString depth-3 trick.**
+
+GBrowser's headless and headed Chromium now ship "Layer C" anti-detection by default, with no opt-in flag. Where the old default masked only `navigator.webdriver`, the browser now also restores the full `window.chrome.*` shape (runtime, app, csi, loadTimes), aligns `Notification.permission` with the Permissions API, reports a per-install `hardwareConcurrency`/`deviceMemory` from the host profile, sweeps the known Selenium/Phantom/Nightmare/Playwright globals, and installs a `Function.prototype.toString` proxy so every patched getter reports `[native code]` even under the depth-3 recursion check. The aggressive `GSTACK_STEALTH=extended` mode (WebGL spoof, faked plugins, mediaDevices) still exists, now layered on top of Layer C rather than replacing it. And stealth applies on all four context-creation paths, so a `useragent` change, a `viewport --scale`, or a headless-to-headed handoff hands a site a fully masked page every time.
+
+### The numbers that matter
+
+Source: `bun test browse/test/stealth-layer-c.test.ts browse/test/stealth-webdriver.test.ts browse/test/stealth-extended.test.ts browse/test/browser-manager-unit.test.ts` (80 tests, real Chromium for the runtime checks).
+
+| Capability | Before (v1.58.1.0) | After (v1.58.3.0) |
+|---|---|---|
+| Automation tells masked by default | 1 (navigator.webdriver) | 7 categories (webdriver, window.chrome.*, Notification, per-install hardware, toString-native, automation-global sweep, cdc/Permissions) |
+| Context paths that apply stealth | 2 (launch, launchHeaded) | 4 (+ handoff, + recreateContext) |
+| toString integrity | not addressed | survives the depth-3 `[native code]` check |
+| Hardware identity | generic Chromium default | per-install, from the host profile |
+| Stealth tests | none dedicated | 80 passing (incl. real-Chromium runtime) |
+
+By default the browser now masks seven categories of automation tell instead of one, on every path a page can reach, not just the first launch.
+
+### What this means for builders
+
+If you drive GBrowser to dogfood, scrape, or QA against anti-bot-protected targets, your sessions look like a real per-install Chrome out of the box. There is no `GSTACK_STEALTH` flag to remember, and no silent gap where a routine `useragent` or `viewport --scale` strips the mask. For gbrowser builds with the Pack 1 C++ patches, set the `GSTACK_*` host-profile env (gbd does this) to push the GPU/UA-CH/hardware spoof down to native code; on stock Playwright Chromium the same call is a safe no-op.
+
+### Itemized changes
+
+#### Added
+- Always-on Layer C stealth (`buildStealthScript`): webdriver mask, `window.chrome.{runtime,app,csi,loadTimes}` shape, `Notification.permission` alignment, per-install `hardwareConcurrency`/`deviceMemory`, a `Function.prototype.toString` proxy that holds up under the depth-3 `[native code]` check, and a static sweep of Selenium/Phantom/Nightmare/Playwright globals.
+- `buildGStackLaunchArgs`: per-install `--gstack-*` cmdline switches (GPU vendor/renderer, UA-CH platform/model, hardware concurrency/memory) for gbrowser's Pack 1 C++ patches, emitted only when the matching `GSTACK_*` env is set so stock Chromium is unaffected.
+- Real-Chromium runtime coverage: webdriver, chrome.* shape, Notification/Permissions pairing, toString depth-3, per-install hardware, and the extended-mode blend (80 stealth tests).
+
+#### Changed
+- Stealth applies on every context-creation path (`launch`, `launchHeaded`, `handoff`, `recreateContext`), so a `useragent`, `viewport --scale`, or handoff keeps the full mask.
+- The cdc_/`__webdriver` cleanup and the Permissions notifications shim live in `applyStealth`, so headless and handoff get the same `Notification.permission`/`permissions.query` consistency as the headed path.
+- `GSTACK_STEALTH=extended` layers on top of Layer C; the always-on default does not fake `navigator.plugins` (the opt-in mode still does, as the documented "may break sites" escape hatch).
+- `--gstack-suppress-prepare-stack-trace` is opt-in via `GSTACK_CDP_STEALTH=on`, so the switch never reaches a Chromium that does not understand it.
+- `--disable-blink-features=AutomationControlled` comes from one shared `STEALTH_LAUNCH_ARGS` constant across every launch path.
+
 ## [1.58.1.0] - 2026-06-14
 
 ## **Local evals stop lying. Spawned `claude` test children run in a sealed clean room,**
@@ -2215,42 +2254,6 @@ If you build the GStack Browser DMG from a workstation where `/tmp` is constrain
 
 ### For contributors
 - `downloadFile`, `parsePdfFromFile`, and `extractCwdFromJsonl` are now exported from their respective modules for test access. Pattern matches the existing `normalizeRemoteUrl` export in `bin/gstack-global-discover.ts`.
-
-## [1.40.0.2] - 2026-05-20
-
-## **Cmd+Q on the browser actually means quit. Process supervisors stop respawning on user-initiated close.**
-## **Chromium exit code is read for what it is: 0 = user wanted this, non-zero = real crash.**
-
-Every browse-server `browser.on('disconnected')` handler exited with a non-zero code regardless of why Chromium left. Process supervisors (gbrowser's gbd HealthMonitor) consumed that as a crash signal and respawned the whole stack on exponential backoff, so a user who Cmd+Q'd the visible browser saw a fresh window pop back 1s later, then 2s, then 4s. The fix reads the underlying ChildProcess's exit code at disconnect time: code 0 + no signal means the user closed Chromium cleanly, anything else means it crashed. We then exit 0 on clean and preserve the legacy per-path code on crash (launch→1, launchHeaded→2, handoff→1). Process supervisors get the signal they were always missing: 0 = "user wanted this, leave it alone"; non-zero = "please bring me back."
-
-### The numbers that matter
-
-Source: `bun test browse/test/browser-manager-unit.test.ts` ... 9 tests across the cause-resolver, all green.
-
-| Surface | Before | After |
-|---|---|---|
-| macOS Cmd+Q on browse-server-managed Chromium | Server exits 1 (or 2 for headed) → supervisor sees crash → respawns with 1s→2s→4s→8s→16s backoff | Server exits 0 → supervisor treats as user intent → does not respawn |
-| Chromium genuinely crashes (SIGSEGV, OOM) | Server exits 1 → respawn | Server exits 1 → respawn (preserved) |
-| Headed Chromium hard-killed (SIGKILL) | Server exits 2 → respawn | Server exits 2 → respawn (preserved) |
-| `handoff()` browser closed during a session | Server exits 1 → respawn | Same clean-vs-crash discrimination as `launch()` |
-| Disconnect handlers | 3 sites, each rolling its own exit logic | 1 helper (`resolveDisconnectCause`) consumed at all 3 sites |
-
-### What this means for builders
-
-If you Cmd+Q a browse-server-managed Chromium window, the window stays gone. The CLI process exits cleanly. Process supervisors leave it alone. The crash-recovery path (Chromium dying mid-task to SIGSEGV / SIGKILL / OOM) still works exactly the same: non-zero exit, supervisor respawns. Reconnect any time with `$B connect` or by re-running your gbd. Pull and your next Cmd+Q is final.
-
-### Itemized changes
-
-#### Added
-
-- `browse/src/browser-manager.ts` (new exports) — `resolveDisconnectCause(browser)` reads the Playwright `Browser.process()` ChildProcess exit code + signal code, returns `'clean'` (exit 0, no signal) or `'crash'` (anything else). Waits up to 1s for the exit if `'disconnected'` fires before the child has fully exited. `handleChromiumDisconnect(browser)` is the headless `launch()` site's one-line dispatcher that consumes the resolver and exits 0 or 1 accordingly.
-- `browse/test/browser-manager-unit.test.ts` — seven new tests pinning the resolver across already-exited / signal-killed / async-exit / null-browser inputs.
-
-#### Fixed
-
-- `browse/src/browser-manager.ts` `launch()` disconnect handler — now exits 0 on clean user-quit, 1 on crash. Previously always exited 1.
-- `browse/src/browser-manager.ts` `launchHeaded()` disconnect handler — clean user-quit exits 0; crash preserves the legacy code 2 so existing supervisors that distinguish "headed crash" from "headless crash" continue to work. `onDisconnect()` cleanup callback fires in both cases.
-- `browse/src/browser-manager.ts` `handoff()` disconnect handler — same clean-vs-crash discrimination via the shared helper so a Cmd+Q after a headless→headed handoff doesn't trigger respawn either.
 
 ## [1.40.0.0] - 2026-05-16
 
