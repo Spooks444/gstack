@@ -2035,7 +2035,7 @@ Shipped in v0.6.5. TemplateContext in gen-skill-docs.ts bakes skill name into pr
 
 **What:** Write a postinstall script that patches Playwright's CDP layer to suppress `Runtime.enable` and use `addBinding` for context ID discovery, same approach as rebrowser-patches. Eliminates the `navigator.webdriver`, `cdc_` markers, and other CDP artifacts that sites like Google use to detect automation.
 
-**Why:** Our current stealth narrows to `navigator.webdriver` masking + ChromeDriver `cdc_` runtime cleanup + Permissions API patch (v1.28.0.0 narrowed it from also faking plugins/languages, since modern fingerprinters punish inconsistent fakes more than they punish admitted defaults). That's enough for most sites but Google still triggers captchas, because the real detection is at the CDP protocol level. rebrowser-patches proved the approach works but their patches target Playwright 1.52.0 and don't apply to our 1.58.2. We need our own patcher using string matching instead of line-number diffs. 6 files, ~200 lines of patches total.
+**Why:** As of v1.58.3.0 our JS-layer stealth is "Layer C" — always-on `navigator.webdriver` mask + `window.chrome.*` shape + `Notification.permission`/Permissions alignment + per-install `hardwareConcurrency`/`deviceMemory` + a `Function.prototype.toString` proxy + an automation-global sweep + ChromeDriver `cdc_`/`__webdriver` cleanup (still NOT faking plugins/languages, since modern fingerprinters punish inconsistent fakes more than they punish admitted defaults). That closes most JS-observable tells, but Google still triggers captchas because the deepest detection is at the CDP protocol level, which a page-world init script can't reach. rebrowser-patches proved the CDP approach works but their patches target Playwright 1.52.0 and don't apply to our 1.58.2. We need our own patcher using string matching instead of line-number diffs. 6 files, ~200 lines of patches total. (Layer C's toString proxy still has descriptor/Reflect.ownKeys surfaces; pushing the spoofs to native code via CDP suppression or the Chromium fork makes the JS layer obsolete.)
 
 **Context:** Full analysis of rebrowser-patches source: patches 6 files in `playwright-core/lib/server/` (crConnection.js, crDevTools.js, crPage.js, crServiceWorker.js, frames.js, page.js). Key technique: suppress `Runtime.enable` (the main CDP detection vector), use `Runtime.addBinding` + `CustomEvent` trick to discover execution context IDs without it. Our extension communicates via Chrome extension APIs, not CDP Runtime, so it should be unaffected. Write E2E tests that verify: (1) extension still loads and connects, (2) Google.com loads without captcha, (3) sidebar chat still works.
 
@@ -2418,3 +2418,41 @@ Pre-existing in `auq-sdk-capture.ts` — affects `skill-e2e-ship-section-loading
 path to the fixture during the run.
 
 **Effort:** S (human ~3h, CC ~30min). **Depends on:** None.
+
+### P3: Content-hash diagram render cache for make-pdf
+
+**What:** Cache rendered diagram SVG/PNG in `~/.gstack/cache/diagram-render/`,
+keyed on `sha256(fence source + bundle version + render options)`, so repeat
+`make-pdf` runs skip the browse render tab for unchanged diagrams.
+
+**Why:** Every run currently re-renders every fence (~150-300ms each). Docs with
+10+ diagrams pay seconds per iteration during write-preview loops. Codex
+outside-voice flagged the missing cache story during the eng review of the
+diagram engine plan (2026-06-11, D7).
+
+**Context:** The diagram-render bundle ships a `BUILD_INFO.json` with a content
+hash (see `lib/diagram-render/`) — use that as the bundle-version cache key
+component so bundle bumps invalidate cleanly. Invalidation surface is the main
+risk: stale renders after a mermaid theme change must not survive. Only worth
+building once users hit multi-diagram docs; wedge perf is fine without it.
+
+**Effort:** S (human ~1d, CC ~30min). **Depends on:** diagram engine wedge
+shipping (lib/diagram-render bundle versioning).
+
+### P3: Dedupe the make-pdf e2e gate-test harness
+
+**What:** Five e2e files (`combined-gate`, `emoji-gate`, `diagram-gate`,
+`landscape-gate`, `format-gate`) each hand-roll the same prerequisite probe
+(binary/browse/poppler checks with CI hard-fail vs local skip), mkdtemp/rm
+lifecycle, and child-timeout constants. Extract a shared
+`make-pdf/test/e2e/helpers.ts` (prerequisites(), withWorkDir(), runGenerate()).
+
+**Why:** Review-army maintainability finding on v1.58.0.0 — the boilerplate
+diverges a little more with each new gate (diagram-gate now captures stderr
+via Bun.spawnSync while the others use execFileSync), and a future fix to the
+CI-hard-fail contract has to land five times.
+
+**Context:** Deferred at ship time (D8.2) because it's test-only churn across
+five green files at the tail of a release. Zero user-facing value; pure DRY.
+
+**Effort:** S (human ~3h, CC ~20min). **Depends on:** None.
