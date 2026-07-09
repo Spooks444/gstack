@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.59.1.0] - 2026-07-09
+
+## **`/codex` docs now point at the GPT-5.6 family and name the new `max` reasoning level.**
+## **No behavior change: /codex still auto-uses whatever Codex's frontier default is.**
+
+The `/codex` skill never hardcodes a model on purpose — it rides whatever Codex ships as its current frontier default, so it picks up new models the day they land. This release refreshes the skill's documentation to match the July 2026 lineup: the illustrative `-m` examples and the "Model & Reasoning" section now reference the GPT-5.6 family (`sol` > `terra` > `luna`, with bare `gpt-5.6` aliasing to `sol`) instead of the retired `gpt-5.1-codex-max` / `gpt-5.2` names, and the reasoning-effort docs now cover the new `max` level that 5.6 adds above `xhigh`. Defaults, flags, and the `--xhigh` override are unchanged.
+
+### The GPT-5.6 numbers that matter
+
+Source: OpenAI's GPT-5.6 launch materials and the OpenRouter API listing (July 2026). These describe the family `/codex` now documents; they are not a gstack benchmark.
+
+| Model | Context | Price /1M (in/out) | Role |
+|-------|---------|--------------------|------|
+| `gpt-5.6-sol` | 1.05M (128k out) | $5 / $30 | Flagship; bare `gpt-5.6` aliases here |
+| `gpt-5.6-terra` | 1.05M (128k out) | $2.50 / $15 | Balanced everyday model |
+| `gpt-5.6-luna` | 1.05M (128k out) | $1 / $6 | Fast and affordable |
+
+Reasoning-effort levels are now `none`, `low`, `medium`, `high`, `xhigh`, `max`. gstack still defaults Review/Challenge to `high` and Consult to `medium`, and wires no flag for `max` (pass `-c model_reasoning_effort=max` by hand if you truly need it).
+
+### What this means for you
+
+Nothing changes in how `/codex` runs — it was already using 5.6 the moment it became Codex's default. The docs just stop pointing at dead model names, so when you reach for `-m` you see the models that actually exist today.
+
+### Itemized changes
+
+#### Changed
+
+- `codex/SKILL.md` (+ template): Model & Reasoning section names the GPT-5.6 family as the current frontier; `-m` examples updated from `gpt-5.1-codex-max` / `gpt-5.2` to `gpt-5.6-sol` / `gpt-5.6-luna`; documented the new `max` reasoning-effort level above `xhigh`. No change to the no-hardcode default or the per-mode reasoning defaults.
+
 ## [1.58.5.0] - 2026-06-21
 
 ## **A fresh install now lands on a concrete first move, not a dead end.**
